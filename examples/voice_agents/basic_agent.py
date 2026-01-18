@@ -37,8 +37,9 @@ logger.setLevel(logging.INFO)
 
 # Passive acknowledgment words - IGNORED when agent is speaking
 IGNORE_WORDS = {
-    "yeah", "ok", "okay", "hmm", "right", "uh-huh", "aha", 
-    "yep", "yup", "mhm", "mm-hmm", "sure", "alright", "gotcha"
+    "yeah", "ok", "okay", "hmm", "right", "uhh", "uh", "uh-huh", "aha",
+    "yep", "yup", "mhm", "mm-hmm", "sure", "alright", "gotcha",
+    "yes", "nope", "nah", "fine", "cool", "nice", "great", "understood", "got", "it"
 }
 
 # Active interruption commands - ALWAYS stop the agent
@@ -62,43 +63,71 @@ def is_only_passive_acknowledgment(text: str) -> bool:
     """Check if input consists ONLY of passive acknowledgment words"""
     normalized = normalize_text(text)
     words = normalized.split()
-    
+
     if len(words) == 0:
         return False
-    
+
     return all(word in IGNORE_WORDS for word in words)
 
 
 def contains_interrupt_command(text: str) -> bool:
     """Check if text contains any interrupt command words"""
     normalized = normalize_text(text)
+
+    # Handle multi-word commands like "hold on", "hang on"
+    for phrase in INTERRUPT_WORDS:
+        if " " in phrase and phrase in normalized:
+            return True
+
     words = normalized.split()
     return any(word in INTERRUPT_WORDS for word in words)
 
 
-def should_interrupt(text: str, agent_is_speaking: bool) -> bool:
+def is_passive_prefix(text: str) -> bool:
     """
-    Core decision logic: Determine if the agent should be interrupted.
-    
+    Detect early partial transcript forms for passive words.
+    This prevents early interruptions on partial STT like: "o", "ok", "h", "hm", "ri", etc.
+    """
+    normalized = normalize_text(text)
+
+    if normalized == "":
+        return False
+
+    passive_prefixes = {
+        "o", "ok", "oka", "okay",
+        "h", "hm", "hmm",
+        "r", "ri", "rig", "righ", "right",
+        "y", "ye", "yea", "yeah",
+        "m", "mh", "mhm",
+        "u", "uh", "uhh"
+    }
+
+    return normalized in passive_prefixes
+
+
+def should_interrupt(text: str, agent_was_speaking: bool) -> bool:
+    """
+    Core decision logic: Determine if the agent should be interrupted and input processed.
+
     Logic Matrix:
-    - If agent is NOT speaking: ALWAYS respond
-    - If agent IS speaking:
-      - Contains interrupt command: INTERRUPT
+    - If agent was NOT speaking: ALWAYS respond
+    - If agent WAS speaking:
+      - Contains interrupt command: INTERRUPT and process
       - Only passive words: IGNORE
-      - Anything else: INTERRUPT
+      - Anything else: INTERRUPT and process
     """
-    if not agent_is_speaking:
-        logger.info(f"✓ RESPOND: Agent is silent - will process '{text}'")
+    if not agent_was_speaking:
+        logger.info(f"✓ RESPOND: Agent was silent - will process '{text}'")
         return True
-    
+
     if contains_interrupt_command(text):
         logger.info(f"🛑 INTERRUPT: Command detected in '{text}'")
         return True
-    
+
     if is_only_passive_acknowledgment(text):
         logger.info(f"✓ IGNORE: Passive acknowledgment '{text}' - Agent continues")
         return False
-    
+
     logger.info(f"🛑 INTERRUPT: Active input detected '{text}'")
     return True
 
@@ -111,7 +140,7 @@ class IntelligentAgent(Agent):
     """
     AI Agent with intelligent interruption handling.
     """
-    
+
     def __init__(self) -> None:
         super().__init__(
             instructions=(
@@ -122,7 +151,8 @@ class IntelligentAgent(Agent):
                 "When explaining complex topics, break them into digestible parts. "
                 "If the user gives short acknowledgments like 'yeah', 'okay', or 'right', "
                 "understand they are listening and continue your explanation naturally without stopping."
-            )
+            ),
+            allow_interruptions=True
         )
 
     @function_tool
@@ -158,83 +188,88 @@ async def entrypoint(ctx: JobContext):
     # ========================================================================
     # SESSION CONFIGURATION
     # ========================================================================
-    
+
     session = AgentSession(
         stt="deepgram/nova-3",
         llm="openai/gpt-4.1-mini",
         tts="cartesia/sonic-2:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
-        turn_detection=MultilingualModel(),
+        turn_detection="manual",
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
+        discard_audio_if_uninterruptible=False
     )
 
     usage_collector = metrics.UsageCollector()
-    
-    # Track agent speaking state
-    agent_speaking_state = {"is_speaking": False, "last_user_input": ""}
+
+    # Track states
+    agent_speaking_state = {"is_speaking": False}
+    user_state = {"was_agent_speaking": False, "current_transcript": ""}
 
     # ========================================================================
-    # EVENT HANDLERS - THE KEY TO SOLVING THIS PROBLEM
+    # EVENT HANDLERS
     # ========================================================================
-    
-    @session.on("user_started_speaking")
-    def on_user_started_speaking(transcript: str):
-        """
-        Critical handler: This fires when user speech is detected.
-        We need to decide IMMEDIATELY if we should stop the agent.
-        """
-        agent_speaking_state["last_user_input"] = transcript
-        is_agent_speaking = (session.agent_state == "speaking")
-        
-        logger.info(f"🎤 User input detected: '{transcript}' | Agent state: {session.agent_state}")
-        
-        # Quick check if this is passive acknowledgment
-        if is_agent_speaking and is_only_passive_acknowledgment(transcript):
-            logger.info(f"✓ IGNORE: Passive acknowledgment detected - NOT stopping agent")
-            # DO NOT call session.stop_speaking() here
-            # Let the agent continue naturally
-            return
-        
-        # Check for interrupt commands
-        if is_agent_speaking and contains_interrupt_command(transcript):
-            logger.info(f"🛑 INTERRUPT: Command word detected - STOPPING agent")
-            session.stop_speaking()
-            return
-        
-        # Check for real interruptions (not just passive acknowledgments)
-        if is_agent_speaking and not is_only_passive_acknowledgment(transcript):
-            logger.info(f"🛑 INTERRUPT: Active input detected - STOPPING agent")
-            session.stop_speaking()
-            return
-        
-        # If agent is not speaking, process normally
-        if not is_agent_speaking:
-            logger.info(f"✓ RESPOND: Agent is silent - will process input")
 
-    @session.on("agent_started_speaking")
-    def on_agent_started_speaking():
-        """Track when agent starts speaking"""
-        agent_speaking_state["is_speaking"] = True
-        logger.info("🗣️ Agent STARTED speaking")
-    
-    @session.on("agent_stopped_speaking")
-    def on_agent_stopped_speaking():
-        """Track when agent stops speaking"""
-        agent_speaking_state["is_speaking"] = False
-        logger.info("🔇 Agent STOPPED speaking")
-        
-        # Check if we should respond to the last user input
-        last_input = agent_speaking_state["last_user_input"]
-        if last_input and not is_only_passive_acknowledgment(last_input):
-            logger.info(f"→ Agent stopped, will process: '{last_input}'")
+    @session.on("agent_state_changed")
+    def on_agent_state_changed(ev):
+        if ev.new_state == "speaking":
+            agent_speaking_state["is_speaking"] = True
+            logger.info("🗣️ Agent STARTED speaking")
+        else:
+            agent_speaking_state["is_speaking"] = False
+            logger.info("🔇 Agent STOPPED speaking")
 
-    @session.on("user_speech_committed")
-    def on_user_speech_committed(transcript: str):
-        """
-        This fires when the full transcript is committed.
-        Good for logging final results.
-        """
-        logger.info(f"✅ Final transcript committed: '{transcript}'")
+    @session.on("user_state_changed")
+    def on_user_state_changed(ev):
+        if ev.new_state == "speaking":
+            user_state["was_agent_speaking"] = agent_speaking_state["is_speaking"]
+            user_state["current_transcript"] = ""
+            logger.info(
+                f"🎤 User started speaking | Agent was speaking: {user_state['was_agent_speaking']}"
+            )
+
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(transcript):
+        user_state["current_transcript"] = transcript.transcript
+        text = normalize_text(user_state["current_transcript"])
+
+        logger.info(f"📝 Transcript received: '{text}' (final: {transcript.is_final})")
+
+        # -------------------------------
+        # PARTIAL TRANSCRIPT HANDLING
+        # -------------------------------
+        if not transcript.is_final:
+            # If agent is speaking and user is giving passive short words → ignore partial completely
+            if user_state["was_agent_speaking"] and is_passive_prefix(text):
+                logger.info(f"✓ IGNORE PARTIAL PASSIVE: '{text}'")
+                return
+
+            # Only interrupt early if a strong interrupt command appears
+            if contains_interrupt_command(text) and user_state["was_agent_speaking"]:
+                logger.info(f"🛑 Early INTERRUPT: Command detected in partial '{text}'")
+                session.interrupt()
+            return
+
+        # -------------------------------
+        # FINAL TRANSCRIPT HANDLING
+        # -------------------------------
+
+        # If agent was speaking and user said ONLY passive words → ignore and keep agent talking
+        if user_state["was_agent_speaking"] and is_only_passive_acknowledgment(text):
+            logger.info(f"✓ IGNORE FINAL PASSIVE: '{text}'")
+            session.clear_user_turn()
+            return
+
+        # Normal logic for real meaningful input
+        if should_interrupt(text, user_state["was_agent_speaking"]):
+            if user_state["was_agent_speaking"] and agent_speaking_state["is_speaking"]:
+                logger.info(f"🛑 INTERRUPT: Stopping agent for '{text}'")
+                session.interrupt()
+
+            logger.info(f"✅ COMMIT: Processing final input '{text}'")
+            session.commit_user_turn()
+        else:
+            logger.info(f"✓ CLEAR: Ignoring final input '{text}'")
+            session.clear_user_turn()
 
     @session.on("metrics_collected")
     def on_metrics_collected(ev: MetricsCollectedEvent):
@@ -252,18 +287,18 @@ async def entrypoint(ctx: JobContext):
     # ========================================================================
     # START SESSION
     # ========================================================================
-    
+
     logger.info("🚀 Starting intelligent agent session...")
     logger.info("=" * 60)
     logger.info("BEHAVIOR:")
-    logger.info("- Agent speaking + user says 'yeah/ok/hmm' → AGENT CONTINUES")
-    logger.info("- Agent speaking + user says 'stop/wait' → AGENT STOPS")
-    logger.info("- Agent silent + user says anything → AGENT RESPONDS")
+    logger.info("- Agent speaking + user says 'yeah/ok/hmm/right' → AGENT CONTINUES, input ignored")
+    logger.info("- Agent speaking + user says 'stop/wait' → AGENT STOPS, processes input")
+    logger.info("- Agent silent + user says anything → PROCESSES input")
     logger.info("=" * 60)
-    
+
     # Create agent instance
     agent = IntelligentAgent()
-    
+
     await session.start(
         agent=agent,
         room=ctx.room,
@@ -284,5 +319,5 @@ if __name__ == "__main__":
     logger.info(f"Ignore words: {IGNORE_WORDS}")
     logger.info(f"Interrupt words: {INTERRUPT_WORDS}")
     logger.info("=" * 60)
-    
+
     cli.run_app(server)
