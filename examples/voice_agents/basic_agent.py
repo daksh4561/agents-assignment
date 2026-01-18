@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit.plugins import silero
 
-# FORCE load .env from current file directory
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 print("ENV CHECK:")
@@ -31,15 +30,12 @@ import asyncio
 logger = logging.getLogger("intelligent-interruption-agent")
 logger.setLevel(logging.INFO)
 
-# ============================================================================
-# CONFIGURABLE IGNORE LIST - Modify these as needed
-# ============================================================================
+
 
 # Passive acknowledgment words - IGNORED when agent is speaking
 IGNORE_WORDS = {
     "yeah", "ok", "okay", "hmm", "right", "uhh", "uh", "uh-huh", "aha",
-    "yep", "yup", "mhm", "mm-hmm", "sure", "alright", "gotcha",
-    "yes", "nope", "nah", "fine", "cool", "nice", "great", "understood", "got", "it"
+    "yep", "yup", "mhm",
 }
 
 # Active interruption commands - ALWAYS stop the agent
@@ -47,9 +43,7 @@ INTERRUPT_WORDS = {
     "stop", "wait", "no", "cancel", "hold", "pause", "hang on", "hold on"
 }
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
+
 
 def normalize_text(text: str) -> str:
     """Normalize text for comparison: lowercase, remove punctuation"""
@@ -74,7 +68,6 @@ def contains_interrupt_command(text: str) -> bool:
     """Check if text contains any interrupt command words"""
     normalized = normalize_text(text)
 
-    # Handle multi-word commands like "hold on", "hang on"
     for phrase in INTERRUPT_WORDS:
         if " " in phrase and phrase in normalized:
             return True
@@ -132,9 +125,6 @@ def should_interrupt(text: str, agent_was_speaking: bool) -> bool:
     return True
 
 
-# ============================================================================
-# AGENT CLASS WITH BUILT-IN FILTERING
-# ============================================================================
 
 class IntelligentAgent(Agent):
     """
@@ -164,9 +154,6 @@ class IntelligentAgent(Agent):
         return f"The weather in {location} is sunny with a temperature of 70 degrees Fahrenheit."
 
 
-# ============================================================================
-# SERVER SETUP
-# ============================================================================
 
 def prewarm(proc: JobProcess):
     """Preload models into process memory for faster session startup"""
@@ -185,9 +172,7 @@ async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     logger.info(f"Starting new session in room: {ctx.room.name}")
 
-    # ========================================================================
-    # SESSION CONFIGURATION
-    # ========================================================================
+    
 
     session = AgentSession(
         stt="deepgram/nova-3",
@@ -201,13 +186,10 @@ async def entrypoint(ctx: JobContext):
 
     usage_collector = metrics.UsageCollector()
 
-    # Track states
     agent_speaking_state = {"is_speaking": False}
     user_state = {"was_agent_speaking": False, "current_transcript": ""}
 
-    # ========================================================================
-    # EVENT HANDLERS
-    # ========================================================================
+    
 
     @session.on("agent_state_changed")
     def on_agent_state_changed(ev):
@@ -234,32 +216,23 @@ async def entrypoint(ctx: JobContext):
 
         logger.info(f"📝 Transcript received: '{text}' (final: {transcript.is_final})")
 
-        # -------------------------------
-        # PARTIAL TRANSCRIPT HANDLING
-        # -------------------------------
+        
         if not transcript.is_final:
-            # If agent is speaking and user is giving passive short words → ignore partial completely
             if user_state["was_agent_speaking"] and is_passive_prefix(text):
                 logger.info(f"✓ IGNORE PARTIAL PASSIVE: '{text}'")
                 return
 
-            # Only interrupt early if a strong interrupt command appears
             if contains_interrupt_command(text) and user_state["was_agent_speaking"]:
                 logger.info(f"🛑 Early INTERRUPT: Command detected in partial '{text}'")
                 session.interrupt()
             return
 
-        # -------------------------------
-        # FINAL TRANSCRIPT HANDLING
-        # -------------------------------
 
-        # If agent was speaking and user said ONLY passive words → ignore and keep agent talking
         if user_state["was_agent_speaking"] and is_only_passive_acknowledgment(text):
             logger.info(f"✓ IGNORE FINAL PASSIVE: '{text}'")
             session.clear_user_turn()
             return
 
-        # Normal logic for real meaningful input
         if should_interrupt(text, user_state["was_agent_speaking"]):
             if user_state["was_agent_speaking"] and agent_speaking_state["is_speaking"]:
                 logger.info(f"🛑 INTERRUPT: Stopping agent for '{text}'")
@@ -284,9 +257,7 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
-    # ========================================================================
-    # START SESSION
-    # ========================================================================
+    
 
     logger.info("🚀 Starting intelligent agent session...")
     logger.info("=" * 60)
@@ -296,7 +267,6 @@ async def entrypoint(ctx: JobContext):
     logger.info("- Agent silent + user says anything → PROCESSES input")
     logger.info("=" * 60)
 
-    # Create agent instance
     agent = IntelligentAgent()
 
     await session.start(
@@ -308,9 +278,6 @@ async def entrypoint(ctx: JobContext):
     )
 
 
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
 
 if __name__ == "__main__":
     logger.info("=" * 60)
